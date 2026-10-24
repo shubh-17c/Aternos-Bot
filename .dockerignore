@@ -1,0 +1,9 @@
+.git
+.env
+state
+__pycache__
+.ruff_cache
+.venv
+*.pyc
+*.png
+README.md
