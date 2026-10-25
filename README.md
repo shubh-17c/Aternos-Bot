@@ -1,16 +1,18 @@
 # Aternos Discord starter
 
-A Discord bot that starts your Aternos Minecraft server when someone says a
-keyword in chat. One command runs a real Chromium browser, clicks **Start**,
-confirms the queue when Aternos asks, accepts the Mojang EULA if it appears, and
-posts a live status embed until the server reports **Online**.
+A Discord bot that starts and stops your Aternos Minecraft server from chat.
+One command runs a real Chromium browser, clicks **Start**, confirms the queue
+when Aternos asks, accepts the Mojang EULA if it appears, and posts a live status
+embed until the server reports **Online**. `/mcstatus` reads the live state,
+players and queue position; `/mcstop` stops the server or cancels a pending
+start.
 
 ```
 #discord
 you: start server
 bot: ⏳ Starting Aternos server …
      Aternos: Preparing …
-     Aternos: Queue position 3
+     Queue position 3 of 12, about 2 min.
      Confirmed the queue spot.
      Aternos: Online
 bot: ✅ @you server is up. Connect with `yourserver.aternos.me`
@@ -29,15 +31,16 @@ means:
 - If you want a supported version of this idea, Aternos' paid sibling
   [exaroton](https://exaroton.com) has autostart-on-join built in.
 - Aternos changes its frontend occasionally. The page ids used here are
-  `#start`, `#confirm`, `#status`; if they rename one, the bot saves a
-  screenshot of the page and posts it in Discord so you can see what broke.
+  `#start`, `#stop`, `#cancel`, `#confirm` and `#status`; if they rename one,
+  the bot saves a screenshot of the page and posts it in Discord so you can see
+  what broke.
 
 ## What's in the box
 
 | File | Purpose |
 | --- | --- |
-| `bot.py` | Discord side: keyword trigger, cooldowns, live embed, `!mcstart`, `!mcstatus` |
-| `aternos_runner.py` | Playwright automation: start, queue confirm, EULA, wait for online |
+| `bot.py` | Discord side: keyword + slash commands, cooldowns, live embeds, admin-gated stop |
+| `aternos_runner.py` | Playwright automation: start, stop/cancel, queue confirm, EULA, live status |
 | `login.py` | One-time local login that saves a browser session |
 | `Dockerfile`, `docker-compose.yml` | Container with Chromium + Xvfb |
 | `.env.example` | All settings, with the safe defaults |
@@ -48,9 +51,9 @@ means:
 2. **Bot** tab → **Reset Token** → copy it. This is `DISCORD_TOKEN`.
 3. On the same page, enable **Message Content Intent** (required for keyword
    detection; without it the bot sees empty messages).
-4. **OAuth2 → URL Generator**: scope `bot`, permissions
-   *View Channels, Send Messages, Embed Links, Attach Files, Read Message
-   History*. Open the generated URL and add the bot to your server.
+4. **OAuth2 → URL Generator**: scope `bot` and `applications.commands`,
+   permissions *View Channels, Send Messages, Embed Links, Attach Files, Read
+   Message History*. Open the generated URL and add the bot to your server.
 
 The bot prints a ready invite URL to its log on startup too.
 
@@ -102,10 +105,12 @@ Useful extras:
 
 | Variable | Default | Notes |
 | --- | --- | --- |
+| `DISCORD_GUILD_ID` | empty (global) | Register slash commands in one server for instant updates |
 | `TRIGGER_KEYWORDS` | `start server,start mc` | Comma-separated, whole-word, case-insensitive |
-| `ALLOWED_CHANNEL_IDS` | empty (all) | Restrict where the keyword works |
-| `ALLOWED_USER_IDS` / `ALLOWED_ROLE_IDS` | empty (everyone) | Lock it down without editing code |
+| `ALLOWED_CHANNEL_IDS` | empty (all) | Restrict where the keyword and `!mc*` commands work |
+| `ALLOWED_USER_IDS` / `ALLOWED_ROLE_IDS` | empty (everyone) | Lock down who can start the server |
 | `COOLDOWN_SECONDS` | `180` | Per-user wait between starts |
+| `STATUS_CACHE_SECONDS` | `60` | How long `/mcstatus` reuses a result before launching a browser |
 | `ATERNOS_SERVER_ID` | last opened | Choose a server on multi-server accounts |
 | `ATERNOS_STATE` | `state/aternos_state.json` | Browser state file written by `login.py` |
 | `ATERNOS_SID` | empty | Optional second session cookie from `login.py` |
@@ -136,17 +141,33 @@ so give it a few minutes.
 Test the automation without Discord (handy for selector/Cloudflare problems):
 
 ```bash
-docker compose run --rm bot python aternos_runner.py
+docker compose run --rm bot python aternos_runner.py start
+docker compose run --rm bot python aternos_runner.py status
+docker compose run --rm bot python aternos_runner.py stop
 ```
 
 ## Using it
 
-- Say `start server` (or any configured keyword) in an allowed channel.
-- `!mcstart` does the same without the keyword.
-- `!mcstatus` re-posts the latest run's embed and log.
-- `!mchelp` lists the active keywords.
-- Only one run at a time; duplicate requests get a short reply instead of a
-  second browser.
+| Command | Who | What |
+| --- | --- | --- |
+| `start server` / `start mc` | everyone (or allowlist) | Keyword trigger; starts the server |
+| `/mcstart` | same as keyword | Slash version of the trigger |
+| `/mcstatus` | everyone | Live state, address, players and queue |
+| `/mcstop` | **Manage Server** | Stops the server, or cancels a queued/starting one |
+| `/mchelp` | everyone | Command summary |
+| `!mcstart`, `!mcstatus`, `!mcstop`, `!mchelp` | same rules | Prefix equivalents |
+
+- Only one browser operation runs at a time; duplicate requests get a short
+  reply instead of a second Chromium instance.
+- `/mcstatus` reuses a result for `STATUS_CACHE_SECONDS` (60 by default) so
+  checking status does not launch a browser every time.
+- `/mcstop` while a start is queued cancels that start, then loads the server
+  page to make sure it is really offline. It requires the **Manage Server**
+  permission.
+- Slash commands are registered on startup. Set `DISCORD_GUILD_ID` for instant
+  per-server registration; global commands can take up to an hour to appear.
+- `ALLOWED_CHANNEL_IDS` applies to the keyword and prefix commands. Slash
+  commands can be restricted with Discord's own **Integrations** settings.
 - The bot never "watches" ads. If Aternos offers an ad versus queue choice, it
   takes the queue path and clicks the green confirm button when it appears. A
   mandatory ad wall cannot be passed headlessly — that shows up as a timeout
@@ -182,11 +203,14 @@ zero), otherwise a queue wait will be killed mid-run.
 | Symptom | Fix |
 | --- | --- |
 | Bot ignores keywords | Message Content Intent is off, or the channel isn't in `ALLOWED_CHANNEL_IDS` |
+| Slash commands missing | Restart the bot and check the sync log line; set `DISCORD_GUILD_ID` for instant registration |
+| "/mcstop" says no permission | The user needs **Manage Server**; server admins can adjust it under Integrations |
 | "Aternos rejected the session" | Re-run `login.py`, update `ATERNOS_SESSION` |
 | "Cloudflare challenge did not pass" | Host IP is blocked — use a residential IP/proxy; see hosting note above |
 | HTTP 403 / "Just a moment..." | Same as Cloudflare; no code change fixes a flagged IP |
 | Stuck at "Preparing" then timeout | Aternos likely changed the UI; check the screenshot the bot posted |
 | Queue confirm never happens | `#confirm` was hidden/disabled while polling. Polling every 7 s covers the confirm window; if it still misses, check the screenshot for a renamed button |
+| `/mcstop` can't find Stop | Aternos renamed the button; check the screenshot/log |
 | "Executable doesn't exist" | Image built without `playwright install` — rebuild with `docker compose build --no-cache` |
 | Bot online, nothing happens | Check `docker compose logs`; the embed log is mirrored there |
 

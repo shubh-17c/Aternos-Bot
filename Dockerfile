@@ -12,7 +12,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium \
     && apt-get update \
-    && apt-get install -y --no-install-recommends xvfb \
+    && apt-get install -y --no-install-recommends xvfb xauth util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .

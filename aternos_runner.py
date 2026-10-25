@@ -1,11 +1,11 @@
 """Drive the Aternos website with a real Chromium browser.
 
 Aternos has no public API. This module does what a human does in the browser:
-open the server page, click Start, confirm the queue spot when asked, accept the
-Mojang EULA if it appears, and wait until the server reports "Online".
+open the server page, start/stop the server, confirm the queue spot when asked,
+accept the Mojang EULA if it appears, and read the live server status.
 
 The UI ids used here are the ones the current Aternos frontend ships:
-    #start, #confirm, #restart, #status
+    #start, #stop, #cancel, #confirm, #status
 If Aternos redesigns the page, the failure screenshot is the quickest way to
 see what changed.
 """
@@ -16,9 +16,10 @@ import asyncio
 import logging
 import os
 import re
+import sys
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -37,6 +38,17 @@ CHROMIUM_ARGS = [
 ADDRESS_RE = re.compile(r"\b([a-z0-9][a-z0-9-]{1,62}\.aternos\.me)\b", re.IGNORECASE)
 EULA_TEXT_RE = re.compile(r"eula|end[- ]?user[- ]?licen[cs]e", re.IGNORECASE)
 ACCEPT_TEXT_RE = re.compile(r"accept|agree|continue|got it|^ok$", re.IGNORECASE)
+STOP_CONFIRM_TEXT_RE = re.compile(r"stop|shut ?down|yes|confirm|ok", re.IGNORECASE)
+
+NUMERIC_STATES = {
+    0: "offline",
+    1: "online",
+    2: "starting",
+    3: "stopping",
+    6: "loading",
+    7: "error",
+    10: "preparing",
+}
 
 EventCallback = Callable[[str], None]
 
@@ -54,18 +66,30 @@ def chrome_user_agent(browser: Browser) -> str:
 
 
 @dataclass
-class StartResult:
+class ServerStatus:
+    state: str
+    address: str | None = None
+    players: list[str] = field(default_factory=list)
+    queue_position: int | None = None
+    queue_count: int | None = None
+    queue_eta: str | None = None
+    raw_text: str = ""
+
+
+@dataclass
+class ActionResult:
     ok: bool
     message: str
     address: str | None = None
     screenshot: str | None = None
+    status: ServerStatus | None = None
 
 
 class AternosError(RuntimeError):
     """Aternos could not be driven (bad session, Cloudflare, changed UI)."""
 
 
-class AternosStarter:
+class AternosController:
     def __init__(
         self,
         state_path: str | Path = "state/aternos_state.json",
@@ -98,10 +122,44 @@ class AternosStarter:
 
     # ------------------------------------------------------------------ public
 
-    async def run(self) -> StartResult:
+    async def run(self) -> ActionResult:
         """Open the server page and keep at it until online, timeout, or error."""
+
+        async def action(page: Page) -> ActionResult:
+            await self._accept_eula(page)
+            return await self._wait_until_online(page)
+
+        return await self._perform(action)
+
+    async def stop(self) -> ActionResult:
+        """Cancel a pending start, or stop a running server."""
+
+        async def action(page: Page) -> ActionResult:
+            return await self._stop_action(page)
+
+        return await self._perform(action)
+
+    async def status(self) -> ActionResult:
+        """Read the current server state, players and queue information."""
+
+        async def action(page: Page) -> ActionResult:
+            current = await self._server_status(page, include_address=True)
+            return ActionResult(
+                True,
+                current.raw_text or current.state,
+                address=current.address,
+                status=current,
+            )
+
+        return await self._perform(action)
+
+    # --------------------------------------------------------------- lifecycle
+
+    async def _perform(
+        self, action: Callable[[Page], Awaitable[ActionResult]]
+    ) -> ActionResult:
         if not self.session_cookie and not self.state_path.exists():
-            return StartResult(
+            return ActionResult(
                 False,
                 "No Aternos session. Set ATERNOS_SESSION (or run login.py to "
                 f"create {self.state_path}).",
@@ -133,20 +191,19 @@ class AternosStarter:
                         "Grab a fresh ATERNOS_SESSION cookie and update the config."
                     )
 
-                self._emit("Logged in. Reading the server page…")
-                await self._accept_eula(page)
-                return await self._wait_until_online(page)
+                self._emit("Logged in.")
+                return await action(page)
 
             except AternosError as exc:
                 self._emit(str(exc))
-                return StartResult(
+                return ActionResult(
                     False, str(exc), screenshot=await self._screenshot(page, "failed")
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.exception("Unexpected automation error")
-                return StartResult(
+                return ActionResult(
                     False,
                     f"Automation error: {exc}",
                     screenshot=await self._screenshot(page, "error"),
@@ -195,7 +252,17 @@ class AternosStarter:
 
         context = await browser.new_context(**kwargs)
 
-        cookies = []
+        cookies = [
+            {
+                "name": "ATERNOS_LANGUAGE",
+                "value": "en",
+                "domain": ".aternos.org",
+                "path": "/",
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        ]
         if self.session_cookie:
             cookies.append(
                 {
@@ -232,8 +299,7 @@ class AternosStarter:
                     "sameSite": "Lax",
                 }
             )
-        if cookies:
-            await context.add_cookies(cookies)
+        await context.add_cookies(cookies)
         return context
 
     # -------------------------------------------------------------------- page
@@ -274,7 +340,7 @@ class AternosStarter:
             page, "#password"
         )
 
-    async def _wait_until_online(self, page: Page) -> StartResult:
+    async def _wait_until_online(self, page: Page) -> ActionResult:
         deadline = time.monotonic() + self.timeout
         last_status = ""
         last_start_click = 0.0
@@ -292,23 +358,20 @@ class AternosStarter:
                     await asyncio.sleep(self.poll_interval)
                     continue
 
-            status, live = await self._snapshot(page)
-            if status and status != last_status:
-                last_status = status
-                self._emit(f"Aternos: {status}")
-                if "queue" in status.casefold():
-                    position = re.search(r"\d+", status)
-                    if position:
-                        self._emit(f"Queue position: {position.group(0)}")
+            current = await self._server_status(page)
+            if current.raw_text and current.raw_text != last_status:
+                last_status = current.raw_text
+                self._emit(f"Aternos: {current.raw_text}")
+                if current.queue_position:
+                    eta = f", about {current.queue_eta}" if current.queue_eta else ""
+                    count = f" of {current.queue_count}" if current.queue_count else ""
+                    self._emit(f"Queue position {current.queue_position}{count}{eta}.")
 
-            state = str(live.get("cls") or live.get("lang") or "").casefold()
-            if (
-                "online" in status.casefold()
-                or state == "online"
-                or live.get("status") == 1
-            ):
-                address = live.get("ip") or await self._read_address(page)
-                return StartResult(True, "Server is online.", address=address)
+            if current.state == "online":
+                full = await self._server_status(page, include_address=True)
+                return ActionResult(
+                    True, "Server is online.", address=full.address, status=full
+                )
 
             confirm_visible = await self._clickable(page, "#confirm")
             if confirm_visible and now - last_confirm > 15:
@@ -322,9 +385,8 @@ class AternosStarter:
                 not confirm_visible
                 and start_clicks < 5
                 and now - last_start_click > 12
-                and "starting" not in status.casefold()
-                and "loading" not in status.casefold()
-                and state not in {"starting", "loading", "preparing", "online"}
+                and current.state
+                not in {"starting", "loading", "preparing", "online", "stopping"}
                 and await self._clickable(page, "#start")
             ):
                 await self._click(page, "#start")
@@ -337,6 +399,143 @@ class AternosStarter:
         raise AternosError(
             f"Timed out after {self.timeout}s waiting for the server. "
             f"Last status: {last_status or 'unknown'}."
+        )
+
+    async def _stop_action(self, page: Page) -> ActionResult:
+        current = await self._server_status(page, include_address=True)
+        self._emit(f"Aternos: {current.raw_text or current.state}")
+
+        if current.state == "offline":
+            return ActionResult(True, "Server is already offline.", status=current)
+
+        if current.state in {"queue", "starting", "loading", "preparing"}:
+            for selector in (
+                "#cancel",
+                "button:has-text('Cancel')",
+                "a:has-text('Cancel')",
+            ):
+                if await self._clickable(page, selector):
+                    await self._click(page, selector)
+                    self._emit("Cancelled the pending start.")
+                    return ActionResult(
+                        True, "Cancelled the pending start.", status=current
+                    )
+
+        stop_selector = None
+        for selector in (
+            "#stop",
+            "button:has-text('Stop')",
+            "a:has-text('Stop')",
+            "[data-action='stop']",
+        ):
+            if await self._clickable(page, selector):
+                stop_selector = selector
+                break
+
+        if stop_selector is None:
+            raise AternosError(
+                "Could not find the Stop button; the Aternos UI may have changed."
+            )
+
+        await self._click(page, stop_selector)
+        self._emit("Clicked Stop. Waiting for the server to shut down…")
+        await asyncio.sleep(1.5)
+        await self._confirm_stop_dialog(page)
+
+        deadline = time.monotonic() + min(self.timeout, 300)
+        last = ""
+        while time.monotonic() < deadline:
+            current = await self._server_status(page)
+            if current.raw_text and current.raw_text != last:
+                last = current.raw_text
+                self._emit(f"Aternos: {last}")
+            if current.state == "offline":
+                return ActionResult(True, "Server is offline.", status=current)
+            await asyncio.sleep(self.poll_interval)
+
+        raise AternosError("Timed out waiting for the server to stop.")
+
+    async def _confirm_stop_dialog(self, page: Page) -> bool:
+        """Click through a 'do you really want to stop?' dialog, if shown."""
+        dialogs = page.locator(".modal, .dialog, [role='dialog']")
+        try:
+            count = await dialogs.count()
+        except PlaywrightError:
+            return False
+
+        for index in range(min(count, 5)):
+            box = dialogs.nth(index)
+            try:
+                if not await box.is_visible():
+                    continue
+                text = (await box.inner_text()).casefold()
+                if not any(
+                    word in text for word in ("stop", "shut down", "disconnect")
+                ):
+                    continue
+                button = (
+                    box.locator("button, a").filter(has_text=STOP_CONFIRM_TEXT_RE).first
+                )
+                if await button.count() and await button.is_visible():
+                    await button.click(timeout=5_000)
+                    self._emit("Confirmed the stop dialog.")
+                    return True
+            except PlaywrightError:
+                continue
+        return False
+
+    # ------------------------------------------------------------------- state
+
+    async def _server_status(
+        self, page: Page, *, include_address: bool = False
+    ) -> ServerStatus:
+        text, live = await self._snapshot(page)
+        lowered = text.casefold()
+        queue = live.get("queue") or {}
+        position = queue.get("position")
+
+        state = NUMERIC_STATES.get(live.get("status"), "")
+        if not state:
+            state = str(live.get("cls") or live.get("lang") or "").casefold()
+
+        if (
+            "queue" in lowered
+            or "confirm" in lowered
+            or (isinstance(position, int) and position > 0)
+        ):
+            state = "queue"
+        elif "online" in lowered:
+            state = "online"
+        elif "offline" in lowered:
+            state = "offline"
+        elif "stopping" in lowered:
+            state = "stopping"
+        elif "starting" in lowered:
+            state = "starting"
+        elif "loading" in lowered or "preparing" in lowered:
+            state = "loading"
+        elif state not in NUMERIC_STATES.values():
+            state = "unknown"
+
+        raw_players = live.get("playerlist") or []
+        players = [str(player) for player in raw_players if str(player).strip()]
+
+        address = live.get("ip") or None
+        if include_address and not address:
+            address = await self._read_address(page)
+
+        return ServerStatus(
+            state=state,
+            address=address,
+            players=players,
+            queue_position=position
+            if isinstance(position, int) and position > 0
+            else None,
+            queue_count=queue.get("count")
+            if isinstance(queue.get("count"), int)
+            else None,
+            queue_eta=queue.get("time") or None,
+            raw_text=text,
         )
 
     async def _close_popups(self, page: Page) -> None:
@@ -355,8 +554,8 @@ class AternosStarter:
 
         Aternos embeds `var lastStatus = {...}` and its frontend keeps that
         object around; `class` is one of offline/loading/preparing/online and
-        `ip` is the server address. Reading it is far less brittle than
-        scraping the status label, and the label stays as a fallback.
+        `ip`/`playerlist`/`queue` come from the same payload. Reading it is far
+        less brittle than scraping labels, and the label stays as a fallback.
         """
         text = await self._status_text(page)
         live: dict = {}
@@ -364,11 +563,20 @@ class AternosStarter:
             live = (
                 await page.evaluate(
                     """() => {
-                    const s = window.lastStatus;
-                    if (!s) return {};
-                    return {status: s.status, cls: s.class, lang: s.lang,
-                            ip: s.ip, port: s.port};
-                }"""
+                        const s = window.lastStatus;
+                        if (!s) return {};
+                        return {
+                            status: s.status, cls: s.class, lang: s.lang,
+                            ip: s.ip, port: s.port, playerlist: s.playerlist,
+                            queue: s.queue ? {
+                                position: s.queue.position,
+                                count: s.queue.count,
+                                time: s.queue.time,
+                                minutes: s.queue.minutes,
+                                status: s.queue.status
+                            } : null
+                        };
+                    }"""
                 )
                 or {}
             )
@@ -476,8 +684,8 @@ class AternosStarter:
                 log.warning("Event callback failed", exc_info=True)
 
 
-def _from_env() -> AternosStarter:
-    return AternosStarter(
+def controller_from_env() -> AternosController:
+    return AternosController(
         state_path=os.getenv("ATERNOS_STATE", "state/aternos_state.json"),
         session_cookie=os.getenv("ATERNOS_SESSION"),
         sid_cookie=os.getenv("ATERNOS_SID"),
@@ -493,6 +701,20 @@ def _from_env() -> AternosStarter:
     )
 
 
+async def _cli(action: str) -> int:
+    controller = controller_from_env()
+    if action == "start":
+        result = await controller.run()
+    elif action == "stop":
+        result = await controller.stop()
+    elif action == "status":
+        result = await controller.status()
+    else:
+        raise SystemExit(f"Unknown action {action!r}; use start, stop or status.")
+    print(result)
+    return 0 if result.ok else 1
+
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
 
@@ -500,6 +722,5 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
-    result = asyncio.run(_from_env().run())
-    print(result)
-    raise SystemExit(0 if result.ok else 1)
+    chosen = sys.argv[1] if len(sys.argv) > 1 else "start"
+    raise SystemExit(asyncio.run(_cli(chosen)))
